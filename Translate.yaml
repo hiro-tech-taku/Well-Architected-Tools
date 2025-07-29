@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 英語から日本語への翻訳後に別のS3へ保管
+
+Parameters:
+  SourceBucketName:
+    Type: String
+    Description: Name of the source S3 bucket
+    Default: before-translate-s3 
+  DestinationBucketName:
+    Type: String
+    Description: Name of the destination S3 bucket
+    Default: after-translate-s3
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: Lambda memory size (MB)
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: Lambda timeout (seconds)
+
+Resources:
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SourceBucketName
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DestinationBucketName
+
+  TranslateLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TranslateCsvPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: 
+                  - !Sub arn:aws:s3:::${SourceBucketName}/*
+                  - !Sub arn:aws:s3:::${DestinationBucketName}/*
+              - Effect: Allow
+                Action:
+                  - translate:TranslateText
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TranslateLambdaFuction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt SourceBucket.Arn
+
+  TranslateLambdaFuction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: wa-translatefile
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TranslateLambdaRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          DEST_BUCKET: !Ref DestinationBucketName
+          SOURCE_BUCKET: !Ref SourceBucketName
+
+      Code:
+        ZipFile: |
+          import os
+          import csv
+          import io
+          from urllib.parse import unquote_plus
+          import boto3
+
+          s3 = boto3.client('s3')
+          translate = boto3.client('translate')
+
+          DEST_BUCKET = os.environ['DEST_BUCKET']
+
+
+          def translate_text(text, source_language="en", target_language="ja"):
+              if not text.strip():
+                  return text
+              response = translate.translate_text(
+                  Text=text,
+                  SourceLanguageCode=source_language,
+                  TargetLanguageCode=target_language
+              )
+              return response['TranslatedText']
+
+          def lambda_handler(event, context):
+              # s3イベントからバケットオブジェクトキー取得
+              source_bucket = event['Records'][0]['s3']['bucket']['name']
+              source_key = unquote_plus(event['Records'][0]['s3']['object']['key'])
+              # ファイルをS3から取得
+              response = s3.get_object(Bucket=source_bucket, Key=source_key)
+              content = response['Body'].read().decode('utf-8')
+
+              # csv読み込み
+              input_csv = csv.reader(io.StringIO(content))
+              output_csv_buffer = io.StringIO()
+              output_csv = csv.writer(output_csv_buffer)
+              # 各行を翻訳
+              for row in input_csv:
+                translated_row = [translate_text(cell) for cell in row]
+                output_csv.writerow(translated_row)
+              # 出力ファイル名を生成
+              filename = os.path.basename(source_key)
+              dest_key = f"output/{filename.replace('.csv','_ja.csv')}" 
+              # 出力先バケットへアップロード
+              s3.put_object(Bucket=DEST_BUCKET, Key=dest_key, Body=output_csv_buffer.getValue().encode('utf-8'))
+              print(f"Translation completed: {source_key} -> {dest_key}")
+              
